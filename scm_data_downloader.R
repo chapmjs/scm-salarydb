@@ -96,15 +96,16 @@ test_db_connection <- function() {
 
 # Check if data already exists for a given year
 check_data_exists <- function(conn, year) {
-  query <- "
+  # Use string interpolation instead of parameterized query for better MariaDB compatibility
+  query <- paste0("
     SELECT 
       COUNT(*) as record_count,
       CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END as exists_flag
     FROM scm_salary_data 
-    WHERE data_year = ? AND data_available = TRUE
-  "
+    WHERE data_year = ", year, " AND data_available = TRUE
+  ")
   
-  result <- dbGetQuery(conn, query, params = list(year))
+  result <- dbGetQuery(conn, query)
   return(list(
     exists = as.logical(result$exists_flag),
     count = result$record_count
@@ -117,8 +118,9 @@ get_occupation_definitions <- function(conn, category = "both") {
     query <- "SELECT occupation_code, occupation_name FROM occupation_definitions WHERE is_active = TRUE"
     result <- dbGetQuery(conn, query)
   } else {
-    query <- "SELECT occupation_code, occupation_name FROM occupation_definitions WHERE occupation_category = ? AND is_active = TRUE"
-    result <- dbGetQuery(conn, query, params = list(category))
+    # Use string interpolation for better MariaDB compatibility
+    query <- paste0("SELECT occupation_code, occupation_name FROM occupation_definitions WHERE occupation_category = '", category, "' AND is_active = TRUE")
+    result <- dbGetQuery(conn, query)
   }
   
   # Convert to named list for compatibility with original code
@@ -270,14 +272,42 @@ insert_salary_data <- function(conn, data_list, year) {
   # Calculate derived fields
   derived <- calculate_derived_fields(data_list)
   
-  # Prepare insert query - using INSERT ... ON DUPLICATE KEY UPDATE
-  query <- "
+  # Helper function to format values for SQL
+  sql_value <- function(val) {
+    if(is.null(val) || is.na(val)) {
+      "NULL"
+    } else if(is.character(val)) {
+      paste0("'", gsub("'", "''", val), "'") # Escape single quotes
+    } else if(is.logical(val)) {
+      if(val) "1" else "0"
+    } else {
+      as.character(val)
+    }
+  }
+  
+  # Build query with direct value substitution for better MariaDB compatibility
+  query <- paste0("
     INSERT INTO scm_salary_data (
       occupation_code, data_year, employment, median_wage, mean_wage,
       median_hourly, mean_hourly, wage_ratio, wage_distribution,
       data_available, bls_employment_series_id, bls_median_wage_series_id, 
       bls_mean_wage_series_id, raw_api_response
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (
+      '", data_list$occupation_code, "',
+      ", year, ",
+      ", sql_value(data_list$employment), ",
+      ", sql_value(data_list$median_wage), ",
+      ", sql_value(data_list$mean_wage), ",
+      ", sql_value(derived$median_hourly), ",
+      ", sql_value(derived$mean_hourly), ",
+      ", sql_value(derived$wage_ratio), ",
+      ", sql_value(derived$wage_distribution), ",
+      ", if(data_list$data_available) "1" else "0", ",
+      '", series_ids[["employment"]], "',
+      '", series_ids[["median_wage"]], "',
+      '", series_ids[["mean_wage"]], "',
+      ", sql_value(data_list$raw_response), "
+    )
     ON DUPLICATE KEY UPDATE
       employment = VALUES(employment),
       median_wage = VALUES(median_wage),
@@ -289,44 +319,37 @@ insert_salary_data <- function(conn, data_list, year) {
       data_available = VALUES(data_available),
       raw_api_response = VALUES(raw_api_response),
       updated_date = CURRENT_TIMESTAMP
-  "
+  ")
   
-  # Handle NULL values properly
-  params <- list(
-    data_list$occupation_code,
-    year,
-    if(is.na(data_list$employment)) NULL else data_list$employment,
-    if(is.na(data_list$median_wage)) NULL else data_list$median_wage,
-    if(is.na(data_list$mean_wage)) NULL else data_list$mean_wage,
-    if(is.na(derived$median_hourly)) NULL else derived$median_hourly,
-    if(is.na(derived$mean_hourly)) NULL else derived$mean_hourly,
-    if(is.na(derived$wage_ratio)) NULL else derived$wage_ratio,
-    derived$wage_distribution, # Can be NULL
-    data_list$data_available,
-    series_ids[["employment"]],
-    series_ids[["median_wage"]],
-    series_ids[["mean_wage"]],
-    data_list$raw_response
-  )
-  
-  dbExecute(conn, query, params = params)
+  dbExecute(conn, query)
 }
 
 # Log refresh attempt
 log_refresh <- function(conn, year, occupation_set, total_occupations, successful_count, api_calls, duration, errors = 0, error_details = NULL) {
   status <- if(errors == 0) "success" else if(successful_count > 0) "partial" else "failed"
   
-  query <- "
+  # Handle NULL error_details properly
+  error_details_sql <- if(is.null(error_details)) "NULL" else paste0("'", gsub("'", "''", error_details), "'")
+  
+  # Use string interpolation for all values to avoid parameter issues
+  query <- paste0("
     INSERT INTO data_refresh_log (
       data_year, occupation_set, occupations_requested, occupations_successful,
       api_calls_made, refresh_duration_seconds, error_count, error_details, refresh_status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  "
+    ) VALUES (
+      ", year, ",
+      '", occupation_set, "',
+      ", total_occupations, ",
+      ", successful_count, ",
+      ", api_calls, ",
+      ", round(duration, 2), ",
+      ", errors, ",
+      ", error_details_sql, ",
+      '", status, "'
+    )
+  ")
   
-  dbExecute(conn, query, params = list(
-    year, occupation_set, total_occupations, successful_count, 
-    api_calls, duration, errors, error_details, status
-  ))
+  dbExecute(conn, query)
 }
 
 # Main download function
@@ -468,4 +491,85 @@ view_recent_data <- function(limit = 10) {
   
   result <- dbGetQuery(conn, query, params = list(limit))
   return(result)
+}
+
+# Debug function to test a single occupation
+test_single_occupation <- function(occupation_code, year = 2023) {
+  if(BLS_API_KEY == "") {
+    stop("BLS API key not found. Please set BLS_KEY environment variable.")
+  }
+  
+  # Get occupation name
+  conn <- get_db_connection()
+  on.exit(dbDisconnect(conn))
+  
+  name_query <- paste0("SELECT occupation_name FROM occupation_definitions WHERE occupation_code = '", occupation_code, "'")
+  name_result <- dbGetQuery(conn, name_query)
+  occupation_name <- if(nrow(name_result) > 0) name_result$occupation_name[1] else "Unknown"
+  
+  log_message(paste("Testing occupation:", occupation_code, "-", occupation_name))
+  log_message(paste("Year:", year))
+  
+  # Get series IDs
+  series_ids <- construct_series_ids(occupation_code)
+  log_message(paste("Series IDs:", paste(series_ids, collapse = ", ")))
+  
+  # Make API call
+  raw_data <- get_occupation_data(occupation_code, year)
+  
+  if(is.null(raw_data)) {
+    log_message("API call returned NULL", "ERROR")
+    return(NULL)
+  }
+  
+  log_message(paste("API Status:", raw_data$status))
+  if(!is.null(raw_data$message)) {
+    log_message(paste("API Message:", paste(raw_data$message, collapse = "; ")))
+  }
+  
+  # Process the data with debug output
+  processed <- process_occupation_data(raw_data, occupation_code, occupation_name)
+  
+  return(list(
+    raw_api_response = raw_data,
+    processed_data = processed
+  ))
+}
+
+# Function to check what years have data for an occupation
+check_available_years <- function(occupation_code, start_year = 2020, end_year = 2024) {
+  if(BLS_API_KEY == "") {
+    stop("BLS API key not found. Please set BLS_KEY environment variable.")
+  }
+  
+  series_ids <- construct_series_ids(occupation_code)
+  
+  payload <- list(
+    'seriesid' = as.vector(series_ids),
+    'startyear' = as.character(start_year),
+    'endyear' = as.character(end_year),
+    'registrationKey' = BLS_API_KEY
+  )
+  
+  response <- blsAPI(payload, api_version = 2)
+  json_data <- fromJSON(response)
+  
+  if(json_data$status != "REQUEST_SUCCEEDED") {
+    log_message(paste("API call failed:", json_data$status), "ERROR")
+    return(NULL)
+  }
+  
+  # Extract available years
+  available_years <- c()
+  if(!is.null(json_data$Results$series)) {
+    for(i in 1:nrow(json_data$Results$series)) {
+      series_data <- json_data$Results$series$data[[i]]
+      if(!is.null(series_data) && nrow(series_data) > 0) {
+        years <- unique(series_data$year)
+        available_years <- c(available_years, years)
+      }
+    }
+  }
+  
+  return(sort(unique(available_years)))
 }
