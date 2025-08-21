@@ -53,12 +53,58 @@ get_db_connection <- function() {
   })
 }
 
+# Test database connection and setup
+test_db_connection <- function() {
+  log_message("Testing database connection...")
+  
+  # Check environment variables
+  required_vars <- c("MYSQL_HOST", "MYSQL_DATABASE", "MYSQL_USERNAME", "MYSQL_PASSWORD")
+  for(var in required_vars) {
+    if(Sys.getenv(var) == "") {
+      log_message(paste("Missing environment variable:", var), "ERROR")
+      return(FALSE)
+    }
+  }
+  
+  # Test connection
+  tryCatch({
+    conn <- get_db_connection()
+    
+    # Test basic query
+    result <- dbGetQuery(conn, "SELECT COUNT(*) as count FROM occupation_definitions")
+    log_message(paste("✓ Connection successful! Found", result$count, "occupation definitions"))
+    
+    # Test if tables exist
+    tables <- dbListTables(conn)
+    expected_tables <- c("occupation_definitions", "scm_salary_data", "data_refresh_log")
+    missing_tables <- expected_tables[!expected_tables %in% tables]
+    
+    if(length(missing_tables) > 0) {
+      log_message(paste("⚠ Missing tables:", paste(missing_tables, collapse = ", ")), "WARN")
+    } else {
+      log_message("✓ All required tables found")
+    }
+    
+    dbDisconnect(conn)
+    return(TRUE)
+    
+  }, error = function(e) {
+    log_message(paste("✗ Connection test failed:", e$message), "ERROR")
+    return(FALSE)
+  })
+}
+
 # Check if data already exists for a given year
 check_data_exists <- function(conn, year) {
-  query <- "CALL CheckDataExists(?, @exists, @count)"
-  dbExecute(conn, query, params = list(year))
+  query <- "
+    SELECT 
+      COUNT(*) as record_count,
+      CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END as exists_flag
+    FROM scm_salary_data 
+    WHERE data_year = ? AND data_available = TRUE
+  "
   
-  result <- dbGetQuery(conn, "SELECT @exists as exists_flag, @count as record_count")
+  result <- dbGetQuery(conn, query, params = list(year))
   return(list(
     exists = as.logical(result$exists_flag),
     count = result$record_count
@@ -69,13 +115,9 @@ check_data_exists <- function(conn, year) {
 get_occupation_definitions <- function(conn, category = "both") {
   if (category == "both") {
     query <- "SELECT occupation_code, occupation_name FROM occupation_definitions WHERE is_active = TRUE"
-  } else {
-    query <- "SELECT occupation_code, occupation_name FROM occupation_definitions WHERE occupation_category = ? AND is_active = TRUE"
-  }
-  
-  if (category == "both") {
     result <- dbGetQuery(conn, query)
   } else {
+    query <- "SELECT occupation_code, occupation_name FROM occupation_definitions WHERE occupation_category = ? AND is_active = TRUE"
     result <- dbGetQuery(conn, query, params = list(category))
   }
   
@@ -228,7 +270,7 @@ insert_salary_data <- function(conn, data_list, year) {
   # Calculate derived fields
   derived <- calculate_derived_fields(data_list)
   
-  # Prepare insert query
+  # Prepare insert query - using INSERT ... ON DUPLICATE KEY UPDATE
   query <- "
     INSERT INTO scm_salary_data (
       occupation_code, data_year, employment, median_wage, mean_wage,
@@ -249,22 +291,25 @@ insert_salary_data <- function(conn, data_list, year) {
       updated_date = CURRENT_TIMESTAMP
   "
   
-  dbExecute(conn, query, params = list(
+  # Handle NULL values properly
+  params <- list(
     data_list$occupation_code,
     year,
-    data_list$employment,
-    data_list$median_wage,
-    data_list$mean_wage,
-    derived$median_hourly,
-    derived$mean_hourly,
-    derived$wage_ratio,
-    derived$wage_distribution,
+    if(is.na(data_list$employment)) NULL else data_list$employment,
+    if(is.na(data_list$median_wage)) NULL else data_list$median_wage,
+    if(is.na(data_list$mean_wage)) NULL else data_list$mean_wage,
+    if(is.na(derived$median_hourly)) NULL else derived$median_hourly,
+    if(is.na(derived$mean_hourly)) NULL else derived$mean_hourly,
+    if(is.na(derived$wage_ratio)) NULL else derived$wage_ratio,
+    derived$wage_distribution, # Can be NULL
     data_list$data_available,
     series_ids[["employment"]],
     series_ids[["median_wage"]],
     series_ids[["mean_wage"]],
     data_list$raw_response
-  ))
+  )
+  
+  dbExecute(conn, query, params = params)
 }
 
 # Log refresh attempt
@@ -380,18 +425,25 @@ if(interactive()) {
   # Interactive usage
   cat("SCM Salary Data Downloader\n")
   cat("Usage examples:\n")
+  cat("  test_db_connection()                 # Test database connection\n")
   cat("  download_scm_data(2024, 'core')     # Download core occupations for 2024\n")
   cat("  download_scm_data(2023, 'both')     # Download all occupations for 2023\n")
   cat("  download_scm_data(2024, 'core', TRUE)  # Force refresh existing data\n")
+  cat("  view_recent_data(10)                # View recent downloads\n")
 } else {
   # Script execution
   args <- commandArgs(trailingOnly = TRUE)
   
-  year <- if(length(args) >= 1) as.numeric(args[1]) else 2024
-  occupation_set <- if(length(args) >= 2) args[2] else "core"
-  force_refresh <- if(length(args) >= 3) as.logical(args[3]) else FALSE
-  
-  result <- download_scm_data(year, occupation_set, force_refresh)
+  # If first argument is "test", run connection test
+  if(length(args) >= 1 && args[1] == "test") {
+    test_db_connection()
+  } else {
+    year <- if(length(args) >= 1) as.numeric(args[1]) else 2024
+    occupation_set <- if(length(args) >= 2) args[2] else "core"
+    force_refresh <- if(length(args) >= 3) as.logical(args[3]) else FALSE
+    
+    result <- download_scm_data(year, occupation_set, force_refresh)
+  }
 }
 
 # Helper function to view recent data

@@ -1,9 +1,17 @@
 -- SCM Salary Database Setup Script
+-- Database: chapmjs_scm_salarydb
+-- Server: mexico.bbfarm.org
+
+USE chapmjs_scm_salarydb;
 
 -- Drop tables if they exist (for clean setup)
 DROP TABLE IF EXISTS scm_salary_data;
 DROP TABLE IF EXISTS occupation_definitions;
 DROP TABLE IF EXISTS data_refresh_log;
+
+-- Drop views if they exist (for clean setup)
+DROP VIEW IF EXISTS v_current_salary_data;
+DROP VIEW IF EXISTS v_salary_summary_by_level;
 
 -- Table 1: Occupation Definitions
 -- This table stores the occupation codes and their metadata
@@ -120,7 +128,7 @@ INSERT INTO occupation_definitions (occupation_code, occupation_name, occupation
 ('53-7065', 'Stockers and Order Fillers', 'extended', 'Operational/Support', 'Other SCM Functions');
 
 -- Create useful views for common queries
-CREATE VIEW v_current_salary_data AS
+CREATE OR REPLACE VIEW v_current_salary_data AS
 SELECT 
     od.occupation_code,
     od.occupation_name,
@@ -140,7 +148,7 @@ LEFT JOIN scm_salary_data sd ON od.occupation_code = sd.occupation_code
 WHERE sd.data_year = (SELECT MAX(data_year) FROM scm_salary_data WHERE data_available = TRUE)
    OR sd.data_year IS NULL;
 
-CREATE VIEW v_salary_summary_by_level AS
+CREATE OR REPLACE VIEW v_salary_summary_by_level AS
 SELECT 
     occupation_level,
     data_year,
@@ -156,20 +164,23 @@ GROUP BY occupation_level, data_year;
 
 -- Create stored procedures for common operations
 
+-- Drop procedures if they exist (for clean setup)
+DROP PROCEDURE IF EXISTS CheckDataExists;
+DROP PROCEDURE IF EXISTS GetLatestRefreshInfo;
+DROP PROCEDURE IF EXISTS CleanOldData;
+
 DELIMITER //
 
--- Procedure to check if data exists for a given year
+-- Procedure to check if data exists for a given year (MariaDB compatible)
 CREATE PROCEDURE CheckDataExists(
-    IN p_year YEAR,
-    OUT p_exists BOOLEAN,
-    OUT p_record_count INT
+    IN p_year YEAR
 )
 BEGIN
-    SELECT COUNT(*) INTO p_record_count
+    SELECT 
+        COUNT(*) as record_count,
+        CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END as exists_flag
     FROM scm_salary_data 
     WHERE data_year = p_year AND data_available = TRUE;
-    
-    SET p_exists = (p_record_count > 0);
 END //
 
 -- Procedure to get the latest refresh information
@@ -199,6 +210,8 @@ BEGIN
     
     DELETE FROM data_refresh_log 
     WHERE data_year < cutoff_year;
+    
+    SELECT CONCAT('Cleaned data older than ', cutoff_year) as result;
 END //
 
 DELIMITER ;
